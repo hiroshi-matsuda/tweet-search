@@ -68,13 +68,13 @@ def main(
         if search_keywords is None:
             raise Exception('search keywords required')
         if accept_regexp_text is None:
-            accept_regexp_text = r'.+'
+            accept_regexp_text = r''
         if reject_regexp_text is None:
-            reject_regexp_text = r'^$'
+            reject_regexp_text = r'(?!)'
         if accept_regexp_user is None:
-            accept_regexp_user = r'.+'
+            accept_regexp_user = r''
         if reject_regexp_user is None:
-            reject_regexp_user = r'^$'
+            reject_regexp_user = r'(?!)'
         if auth_json_path is None:
             auth_json_path = './auth.json'
         latest_tweet_id = None
@@ -91,12 +91,12 @@ def main(
     for k, v in config.items():
         print('  ', k, '=', v)
     if old_search_keywords:
-        print('Search keywords changed from "{}" to "{}". Will recreate tweets.jsonl and refetch all search result.'.format(
+        print('Search keywords changed from "{}" to "{}".'.format(
             config['search_condition'],
             search_keywords,
         ))
     if recreate_filtered_txt:
-        print('Will recreate filtered.txt by applying filters for tweets.jsonl.')
+        print('Will recreate filtered.txt by applying filters to tweets.jsonl.')
 
     with open(auth_json_path, 'r') as f:
         auth = OAuth1(**json.load(f))
@@ -132,7 +132,7 @@ def main(
     )
     config["latest_tweet_id"] = latest_tweet_id
 
-    with open(tweets_path, 'w' if old_search_keywords else 'a') as f:
+    with open(tweets_path, 'a') as f:
         for tweet in tweets:
             json.dump(
                 tweet,
@@ -217,7 +217,7 @@ def resolve_redirects(text):
     result = ''
     prev = 0
     for m in URL_PATTERN.finditer(text):
-        def _timeout(signum, frame):
+        def _timeout(_, __):
             raise Exception('timeout')
         signal.signal(signal.SIGALRM, _timeout)
         signal.alarm(5)
