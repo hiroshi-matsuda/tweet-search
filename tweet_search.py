@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import re
+import signal
 import sys
 import time
 from urllib.parse import quote_plus, unquote_plus
@@ -21,6 +22,7 @@ SEARCH_API = "https://api.twitter.com/1.1/search/tweets.json"
     reject_regexp_text=("reject regexp for text (default='^$')", "option", "r", str),
     accept_regexp_user=("accept regexp for user (default='.+')", "option", "u", str),
     reject_regexp_user=("reject regexp for user (default='^$')", "option", "v", str),
+    recreate_filtered_txt=("recreate filtered.txt", "flag", "f"),
     auth_json_path=("auth json path (default=./auth.json)", "option", "a", str),
     max_pages=("max pages (default=0)", "option", "p", int),
     output_directory=("output directory (default=./)", "option", "o", Path),
@@ -31,11 +33,15 @@ def main(
         reject_regexp_text=None,
         accept_regexp_user=None,
         reject_regexp_user=None,
+        recreate_filtered_txt=False,
         auth_json_path=None,
         max_pages=0,
         output_directory=Path('./'),
 ):
     config_path = output_directory / 'config.json'
+    tweets_path = output_directory / 'tweets.jsonl'
+    filtered_path = output_directory / 'filtered.txt'
+    old_search_keywords = None
 
     try:
         with open(config_path, 'r') as f:
@@ -44,10 +50,7 @@ def main(
                 latest_tweet_id = config['latest_tweet_id']
             else:
                 if search_keywords:
-                    print('Search keywords changed from "{}" to "{}". Will fetch all search result.'.format(
-                        config['search_condition'],
-                        search_keywords,
-                    ))
+                    old_search_keywords = config['search_keywords']
                 latest_tweet_id = None
             if search_keywords is None:
                 search_keywords = config['search_keywords']
@@ -87,35 +90,60 @@ def main(
     print('search configuration:')
     for k, v in config.items():
         print('  ', k, '=', v)
+    if old_search_keywords:
+        print('Search keywords changed from "{}" to "{}". Will recreate tweets.jsonl and refetch all search result.'.format(
+            config['search_condition'],
+            search_keywords,
+        ))
+    if recreate_filtered_txt:
+        print('Will recreate filtered.txt by applying filters for tweets.jsonl.')
 
     with open(auth_json_path, 'r') as f:
         auth = OAuth1(**json.load(f))
 
-    tweets = search_tweets(
-        auth,
-        latest_tweet_id,
-        search_keywords,
-        max_pages,
+    tweets = sorted(
+        search_tweets(
+            auth,
+            latest_tweet_id,
+            search_keywords,
+            max_pages,
+        ), key=lambda t: t['id']
     )
-    if not tweets:
+    prev_tweets = []
+    if recreate_filtered_txt:
+        try:
+            with open(tweets_path, 'r') as f:
+                prev_tweets = [json.loads(line) for line in f]
+        except FileNotFoundError:
+            pass
+    if not prev_tweets and not tweets:
         return
     tweets = sorted(tweets, key=lambda t: t['id'])
-    latest_tweet_id = tweets[-1]['id']
+    total_tweets = prev_tweets + tweets
+    latest_tweet_id = total_tweets[-1]['id']
 
     print('apply filters')
     filtered_tweets = filter_tweets(
-        tweets,
+        total_tweets,
         accept_regexp_text,
         reject_regexp_text,
         accept_regexp_user,
         reject_regexp_user,
     )
-    with open('tweets.txt', 'a') as f:
+    config["latest_tweet_id"] = latest_tweet_id
+
+    with open(tweets_path, 'w' if old_search_keywords else 'a') as f:
+        for tweet in tweets:
+            json.dump(
+                tweet,
+                f,
+                ensure_ascii=False,
+            )
+            print(file=f)
+    with open(filtered_path, 'w' if recreate_filtered_txt else 'a') as f:
         for tweet in filtered_tweets:
             print_tweet(tweet, file=f)
             print_tweet(tweet, file=sys.stdout)
-
-    config["latest_tweet_id"] = latest_tweet_id
     with open(config_path, 'w') as f:
         json.dump(
             config,
@@ -146,6 +174,7 @@ def search_tweets(
             'q': search_keywords,
             'count': 100,
             'include_entities': 'false',
+            'tweet_mode': 'extended',
             'max_id': max_id,
             'since_id': latest_tweet_id,
         })
@@ -154,9 +183,11 @@ def search_tweets(
             response = requests.get(url, auth=auth)
             statuses = response.json()['statuses']
             print(' ->', len(statuses), 'tweets')
-        except:
+        except KeyboardInterrupt as e:
+            raise e
+        except Exception as e:
             start = datetime.now() + timedelta(minutes=15)
-            print('wait 15 min', start.strftime('%Y-%m-%d %H:%M:%S'))
+            print(' ({} - wait until {}) '.format(str(e), start.strftime('%H:%M:%S')), end='', flush=True)
             time.sleep(900)
             statuses = []
         if not statuses:
@@ -166,8 +197,12 @@ def search_tweets(
             continue
         retry = 0
         for tweet in statuses:
-            tweet['text'] = resolve_redirects(tweet['text'])
-        tweets += statuses
+            tweets.append({
+                'id': tweet['id'],
+                'created_at': tweet['created_at'],
+                'text': resolve_redirects(tweet['full_text']),
+                'user': tweet['user']['name'],
+            })
         count += 1
         if max_pages != 0 and count >= max_pages:
             break
@@ -182,13 +217,22 @@ def resolve_redirects(text):
     result = ''
     prev = 0
     for m in URL_PATTERN.finditer(text):
+        def _timeout(signum, frame):
+            raise Exception('timeout')
+        signal.signal(signal.SIGALRM, _timeout)
+        signal.alarm(5)
         try:
-            url = unquote_plus(requests.get(m.group(0), timeout=3.0).url)
-            print('resolved', m.group(0), '->', url)
+            print('resolving', m.group(0), '-> ', end='', flush=True)
+            url = unquote_plus(requests.get(m.group(0), timeout=3.1).url)
+            print(url)
             result += text[prev:m.start()] + url
             prev = m.end()
-        except:
-            print('not resolved', m.group(0))
+        except KeyboardInterrupt as e:
+            raise e
+        except Exception as e:
+            print('failed:', e)
+        finally:
+            signal.alarm(0)
     result += text[prev:]
     return result
 
@@ -206,10 +250,10 @@ def filter_tweets(
     reject_regexp_user = re.compile(reject_regexp_user)
     return [
         t for t in tweets if (
-            accept_regexp_text.match(t['text']) and
-            not reject_regexp_text.match(t['text']) and
-            accept_regexp_user.match(t['user']['name']) and
-            not reject_regexp_user.match(t['user']['name'])
+            accept_regexp_text.search(t['text']) and
+            not reject_regexp_text.search(t['text']) and
+            accept_regexp_user.search(t['user']) and
+            not reject_regexp_user.search(t['user'])
         )
     ]
 
@@ -218,7 +262,7 @@ def print_tweet(t, file):
     print(' '.join([
         'https://twitter.com/i/web/status/' + str(t['id']),
         (parser.parse(t['created_at']) + timedelta(hours=9)).strftime('%Y-%m-%d %H:%M:%S'),
-        t['user']['name'],
+        t['user'],
         t['text'].replace('\t', ' ').replace('\n', ' '),
     ]), file=file)
 
